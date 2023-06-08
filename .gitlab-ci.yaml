@@ -1,0 +1,214 @@
+stages:
+  - stage-build
+  - stage-analyze
+  - stage-test
+  - stage-deploy
+  - prod-build
+  - prod-deploy
+
+services:
+  - postgres:14.7-alpine
+
+
+variables:
+  CONTAINER_IMAGE_PATH: $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA #see https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+  POSTGRES_DB: symfony_db
+  POSTGRES_USER: symfony_user
+  POSTGRES_PASSWORD: symfony_pass
+  POSTGRES_HOST_AUTH_METHOD: trust
+  DB_HOST: postgres
+  DB_NAME: symfony_db
+  DB_USER: symfony_user
+  DB_PASSWORD: symfony_pass
+  DB_PORT: 5432
+
+before_script:
+  # https://docs.gitlab.com/ce/ci/variables/predefined_variables.html
+  - echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+
+build-test:
+  stage: stage-build
+  environment: test
+  image: docker:20.10
+  only:
+    - staging
+    - main
+  services:
+    - docker:20.10-dind
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build
+      --pull
+      -f ./docker/php-fpm/Dockerfile
+      --build-arg BUILD_MODE=dev
+      --cache-from $CI_REGISTRY_IMAGE:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  tags:
+    - git-patafinance-lv
+
+#cs fixer:
+#  stage: stage-analyze
+#  variables:
+#    GIT_STRATEGY: none
+#  script:
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "php ./vendor/bin/php-cs-fixer fix --dry-run --diff"
+#  tags:
+#    - docker-git-patafinance-lv
+#
+#deptrac:
+#  stage: stage-analyze
+#  variables:
+#    GIT_STRATEGY: none
+#  script:
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/deptrac analyze"
+#  tags:
+#    - docker-git-patafinance-lv
+#
+#phpstan:
+#  stage: stage-analyze
+#  variables:
+#    GIT_STRATEGY: none
+#  script:
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpstan analyse -c phpstan.neon"
+#  tags:
+#    - docker-git-patafinance-lv
+
+composer-validate:
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "composer validate --no-check-all --strict"
+  tags:
+    - docker-git-patafinance-lv
+
+schema-validate:
+  needs:
+    - composer-validate
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "php bin/console doctrine:schema:create"
+    - docker exec $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA "php bin/console doctrine:schema:validate"
+  tags:
+    - docker-git-patafinance-lv
+
+
+phpunit:
+  stage: stage-test
+  environment: test
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "php bin/phpunit"
+  tags:
+    - docker-git-patafinance-lv
+
+
+deploy-staging:
+  stage: stage-deploy
+  image: ictu/sshpass
+  environment: staging
+  only:
+    - staging
+  before_script:
+    - export SSHPASS=$SERVER_PASSWORD
+  script:
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "echo '$PROD_ENVS' > /var/www/symfony/.env.local"
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "docker stop symfony || true"
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "docker rm -v symfony || true"
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "docker run --env-file /var/www/symfony/.env.local --name symfony -d --restart always -p 880:8080 $CONTAINER_IMAGE_PATH"
+  tags:
+    - stage-patafinance-lv
+
+
+build-prod:
+  stage: prod-build
+  environment: production
+  image: docker:20.10
+  only:
+    - main
+  services:
+    - docker:20.10-dind
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build
+      --pull
+      -f ./docker/php-fpm/Dockerfile
+      --build-arg BUILD_MODE=production
+      --cache-from $CI_REGISTRY_IMAGE:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  tags:
+    - git-patafinance-lv
+
+
+Push latest:
+  variables:
+    GIT_STRATEGY: none
+  stage: prod-build
+  needs:
+    - build-prod
+  only:
+    - main
+
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+  tags:
+    - git-patafinance-lv
+
+
+deploy-prod:
+  stage: prod-deploy
+  image: ictu/sshpass
+  environment: production
+  only:
+    - main
+  when: manual
+  before_script:
+    - export SSHPASS=$SERVER_PASSWORD
+  script:
+    - sshpass -e ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "kubectl set image deployment/my-deployment my-container=$CONTAINER_IMAGE_PATH && kubectl rollout status deployment/my-deployment"
+  tags:
+    - prod-patafinance-lv
+
+
+#test:
+#  stage: stage-analyze
+#  image: docker:20.10
+#  environment: test
+#  services:
+#    - docker:20.10-dind
+#  script:
+##    - docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+##    - docker pull --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpunit"
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpunit"
+#  tags:
+#    - docker-git-patafinance-lv
+#  after_script:
+#    - if [ $CI_JOB_STATUS == "failed" ]; then ./cleanup_image.sh; fi
